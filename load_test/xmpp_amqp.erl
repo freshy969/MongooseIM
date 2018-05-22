@@ -13,7 +13,7 @@
 %% Function get_my_role(MyId) returns role for each user, basing on IS_AMQP and
 %% IS_XMPP macros. To modify ratio of users type, please modify macros.
 %%
-%% XMPP users works as follow:
+%% XMPP users work as follow:
 %% - connect to XMPP server
 %% - schedule going online
 %% - schedule sending message
@@ -29,8 +29,9 @@
 %% AMQP users works as follow:
 %% - open channel within existing connection
 %% - creates its own queue
-%% - binds own queue with presence exchanges of ?NUMBER_OF_PREV_NEIGHBOURS and ?NUMBER_OF_NEXT_NEIGHBOURS
-%%   XMPP users are chosen.
+%% - binds own queue with ?AMQP_PRESENCE_EXCHANGE exchange for
+%%   ?NUMBER_OF_PREV_NEIGHBOURS and ?NUMBER_OF_NEXT_NEIGHBOURS
+%%   XMPP users.
 %% - subscribes to own queue
 %% - wait for synchronization with all other users
 %% - They wait for #'basic_deliver'{} events. Currently it is ignored, just debug
@@ -46,11 +47,17 @@
 %% General settings
 -define(NUMBER_OF_PREV_NEIGHBOURS, 4).
 -define(NUMBER_OF_NEXT_NEIGHBOURS, 4).
+-define(MAX_RETRIES, 5).
+-define(SLEEP_TIME_BEFORE_RETRY, 5000). % milliseconds
+% MAX_RETRIES and SLEEP_TIME_BEFORE_RETRY and used for
+%  - connectiong to XMPP
+%  - connection to AMQP
+%  - opening channel via AMQP connection
 
 %% XMPP stuff
--define(XMPP_GO_OFFLINE_AFTER, 1*1000).
--define(XMPP_GO_ONLINE_AFTER, 1*1000).
--define(XMPP_SEND_MESSAGE_AFTER, 30*1000).
+-define(XMPP_GO_OFFLINE_AFTER, 1*1000). % milliseconds
+-define(XMPP_GO_ONLINE_AFTER, 1*1000).  % milliseconds
+-define(XMPP_SEND_MESSAGE_AFTER, 30*1000). % milliseconds
 
 -define(HOST, <<"localhost">>). %% The virtual host served by the server
 -define(XMPP_RESOURCE, <<"resource">>).
@@ -58,7 +65,8 @@
 
 %% rabbit stuff
 -define(RABBIT_CONNECTIONS, 10).
--define(RABBIT_XMPP_EVENTS_TO_BIND, [login, logout, chat]).
+-define(AMOC_AMQP_CONNECTIONS_TABLE_NAME, amoc_amqp_connections).
+-define(AMQP_PRESENCE_EXCHANGE, <<"presence">>).
 
 
 %% Metrics should be defined here
@@ -166,8 +174,8 @@ datapoints(histogram) -> [mean, min, max, median, 95, 99, 999].
 % Assigning fuctions
 %================================================
 
--define(IS_AMQP(ID), ID rem 3 == 0).
--define(IS_XMPP(ID), ID rem 3 =/= 0).
+-define(IS_AMQP(ID), ID rem 10 == 0).
+-define(IS_XMPP(ID), ID rem 10 =/= 0).
 
 %% @doc This function returns role for specific user.
 -spec get_my_role(amoc_scenario:user_id()) -> role().
@@ -291,16 +299,22 @@ amqp_do(State) ->
 
 -spec connect_xmpp(proplists:proplist()) -> escalus:client().
 connect_xmpp(Cfg) ->
-    case catch timer:tc(escalus_connection, start, [Cfg]) of
+    connect_xmpp(Cfg, ?MAX_RETRIES).
+
+-spec connect_xmpp(proplists:proplist(), non_neg_integer()) -> escalus:client().
+connect_xmpp(_Cfg, 0) -> error("Could not connect to XMPP, check logs");
+connect_xmpp(Cfg, Retries) ->
+    try timer:tc(escalus_connection, start, [Cfg]) of
         {ConnectionTime, {ok, Client, _EscalusSessionFeatures}} ->
             exometer:update(?CONNECTION_COUNT(xmpp), 1),
             exometer:update(?CONNECTION_TIME(xmpp), ConnectionTime),
-            Client;
+            Client
+    catch
         Error ->
             exometer:update(?CONNECTION_FAILURE(xmpp), 1),
             lager:error("Could not connect user=~p, reason=~p", [Cfg, Error]),
-            timer:sleep(5000),
-            connect_xmpp(Cfg)
+            timer:sleep(?SLEEP_TIME_BEFORE_RETRY),
+            connect_xmpp(Cfg, Retries - 1)
     end.
 
 -spec send_presence_available(escalus:client()) -> ok.
@@ -332,18 +346,20 @@ send_message(Client, ToId) ->
 %  - connections count
 -spec connect_amqp(#amqp_params_network{}) -> ok | no_return().
 connect_amqp(Params) ->
-    connect_amqp(Params, 5).
+    connect_amqp(Params, ?MAX_RETRIES).
 
 connect_amqp(_Params, 0) -> error("Could not connect to Rabbit, check logs");
 connect_amqp(Params, Retries) ->
-    case catch timer:tc(amqp_connection, start, [Params]) of
-        {ConnectionTime, {ok, _Connection}} ->
+    try timer:tc(amqp_connection, start, [Params]) of
+        {ConnectionTime, {ok, Connection}} ->
             exometer:update(?CONNECTION_COUNT(amqp), 1),
             exometer:update(?CONNECTION_TIME(amqp), ConnectionTime),
-            ok;
+            Connection
+    catch
         Error ->
             exometer:update(?CONNECTION_FAILURE(amqp), 1),
             lager:error("Could not connect to Rabbit, reason=~p", [Error]),
+            timer:sleep(?SLEEP_TIME_BEFORE_RETRY),
             connect_amqp(Params, Retries - 1)
     end.
 
@@ -354,53 +370,57 @@ connect_amqp(Params, Retries) ->
 %  - open channel time
 %  - opened channels count
 -spec open_channel() -> ChannelPid :: pid() | no_return().
-open_channel() -> open_channel(5).
+open_channel() -> open_channel(?MAX_RETRIES).
 
 open_channel(0) -> error("Could not open channel, see logs");
 open_channel(Retries) ->
     Connection = get_amqp_connection(),
-    case catch timer:tc(amqp_connection, open_channel, [Connection]) of
+    try timer:tc(amqp_connection, open_channel, [Connection]) of
         {ConnectionTime, {ok, Channel}} ->
             exometer:update(?OPEN_CHANNELS, 1),
             exometer:update(?OPEN_CHANNEL_TIME, ConnectionTime),
-            Channel;
+            Channel
+    catch
         Error ->
             exometer:update(?OPEN_CHANNEL_FAILURE, 1),
             lager:error("Could not open channel to Rabbit, reason=~p", [Error]),
+            timer:sleep(?SLEEP_TIME_BEFORE_RETRY),
             open_channel(Retries - 1)
     end.
 
 -spec create_queue(ChannelPid :: pid(), QueueName :: binary()) -> ok | error.
-create_queue(Channel, QueueName) ->
+create_queue(ChannelPid, QueueName) ->
     Declare = #'queue.declare'{queue = QueueName},
-    case amqp_channel:call(Channel, Declare) of
+    try amqp_channel:call(ChannelPid, Declare) of
         #'queue.declare_ok'{} ->
             lager:info("Declared queue for ~p", [QueueName]),
-            ok;
+            ok
+    catch
         Err ->
             lager:error("Couldnt declare queue ~p", [Err]),
-            errror
+            error
     end.
 
--spec subscribe_to_queue(ChannelPid :: pid, QueueName ::binary()) ->
+-spec subscribe_to_queue(ChannelPid :: pid(), QueueName ::binary()) ->
     ok | error.
-subscribe_to_queue(Channel, QueueName) ->
+subscribe_to_queue(ChannelPid, QueueName) ->
     Consume = #'basic.consume'{queue = QueueName,
                                consumer_tag = <<"amoc">>,
                                no_ack = true},
-    case amqp_channel:subscribe(Channel, Consume, self()) of
+    try amqp_channel:subscribe(ChannelPid, Consume, self()) of
         #'basic.consume_ok'{} ->
             lager:info("Successfully subscribed to queue ~p ", [QueueName]),
-            ok;
+            ok
+    catch
         Err ->
             lagger:error("Couldnt subscribe to queue ~p, reason: ~p", [QueueName, Err]),
             error
     end.
 
-%% @doc Function binds given queue to exchanges where neighborIDs are pushing
-%% presence events.
+%% @doc Function binds given queue to exchange, where XMPP users are pushing
+%% presence events, for given NeighborIDs' presences.
 %%
-%% As a result, all messages presence messages published to neighbor exchanges
+%% As a result, all messages presence messages published to exchange
 %% will be routed to the given queue. This does not mean user will receive
 %% them. To receive them, user need to be subscribed to Queue. Returns
 %% ok on success, error on error.
@@ -409,12 +429,12 @@ subscribe_to_queue(Channel, QueueName) ->
       ChannelPid  :: pid(),
       Queue       :: binary(),
       NeighborIDs :: [amoc_scenario:user_id()].
-bind_queue_to_presence_exchange(Channel, Queue, NeighborIDs) ->
-    Exchange = amoc_config:get(rabbit_presence_exchange, <<"presence">>),
+bind_queue_to_presence_exchange(ChannelPid, Queue, NeighborIDs) ->
+    Exchange = amoc_config:get(rabbit_presence_exchange, ?AMQP_PRESENCE_EXCHANGE),
     RoutingKeys =
-      [routing_keys_for_user(presence, ID, all_topics) || ID <- NeighborIDs],
+      [routing_key_for_user(presence, ID, all_topics) || ID <- NeighborIDs],
     Results =
-      [bind_queue_to_exchange(Channel, Queue, Exchange, RoutingKey)
+      [bind_queue_to_exchange(ChannelPid, Queue, Exchange, RoutingKey)
        || RoutingKey <- RoutingKeys],
     return_ok_if_all_ok_else_error(Results).
 
@@ -423,13 +443,14 @@ bind_queue_to_presence_exchange(Channel, Queue, NeighborIDs) ->
                              Queue       :: binary(),
                              Exchange    :: binary(),
                              RoutingKey  :: binary()) -> ok | error.
-bind_queue_to_exchange(Channel, Queue, Exchange, RoutingKey) ->
+bind_queue_to_exchange(ChannelPid, Queue, Exchange, RoutingKey) ->
     Binding = #'queue.bind'{queue = Queue,
                             exchange = Exchange,
                             routing_key = RoutingKey},
-    case amqp_channel:call(Channel, Binding) of
+    try amqp_channel:call(ChannelPid, Binding) of
         #'queue.bind_ok'{} ->
-            ok;
+            ok
+    catch
         Err ->
             lager:error("Could not bind queue ~p to exchange ~p error: ~p", [Queue, Exchange, Err]),
             error
@@ -473,39 +494,44 @@ ensure_amqp_connection_pool() ->
                                   port = Port,
                                   username = Username,
                                   password = Password},
-    [connect_amqp(Params) || _ <- lists:seq(1, ?RABBIT_CONNECTIONS)].
+    Connections =
+      [{Num, connect_amqp(Params)} || Num <- lists:seq(1, ?RABBIT_CONNECTIONS)],
+    ets:new(?AMOC_AMQP_CONNECTIONS_TABLE_NAME, [set,
+                                                protected,
+                                                named_table,
+                                                {read_concurrency, true}]),
+    lists:foreach(fun ({_Num, _ConnectPid} = Elem) ->
+                          ets:insert(?AMOC_AMQP_CONNECTIONS_TABLE_NAME, Elem)
+                  end,
+                  Connections).
 
-% @doc This helper function utilizes internal amqp_client supervisor as
-% a pool manager. Returns pid which identifies amqp connection handler.
+% @doc This helper function returns AMQP connections, which are stored in
+% ?AMOC_AMQP_CONNECTIONS_TABLE
 -spec get_amqp_connection() -> ConnectionPid :: pid() | no_return().
 get_amqp_connection() ->
-    ConnectionSups = supervisor:which_children(amqp_sup),
-    Length = length(ConnectionSups),
-    {_, Pid, _, _} = lists:nth(rand:uniform(Length), ConnectionSups),
-    Workers = supervisor:which_children(Pid),
-    case lists:keyfind(connection, 1, Workers) of
-        {connection, Pid2, worker, [amqp_gen_connection]} -> Pid2;
-        _ -> error(no_connection)
-    end.
+    Position = rand:uniform(?RABBIT_CONNECTIONS),
+    [{_, ConnectionPid}] = ets:lookup(?AMOC_AMQP_CONNECTIONS_TABLE_NAME, Position),
+    ConnectionPid.
 
 -spec make_queue_name(amoc_scenario:user_id()) -> binary().
 make_queue_name(Id) ->
     BinInt = integer_to_binary(Id),
     <<"amoc_amqp_", BinInt/binary>>.
 
-%% @doc Returns routing keys, which should be used to bind to given Exchange,
+%% @doc Returns routing key, which should be used to bind to given Exchange,
 %% for given user, for given topic (or 'all_topic').
 %%
 %% Presence exchange
 %% ---
 %%
-%% It publishes all event with user's JID topic. So, this is possible to bind
-%% only for all events (user online or user offline) for given user.
--spec routing_keys_for_user(ExchangeType :: presence,
+%% It publishes all event with user's bare JID as a routing key. So, it is
+%% possible to bind only for all events (user online or user offline) for
+%% given user.
+-spec routing_key_for_user(ExchangeType :: presence,
                             UserID       :: amoc_scenario:user_id(),
                             Topics       :: all_topics) ->
-    RoutingKeys :: [binary()].
-routing_keys_for_user(presence, ID, all_topics) ->
+    RoutingKey :: [binary()].
+routing_key_for_user(presence, ID, all_topics) ->
     make_bare_jid(ID).
 
 %================================================
@@ -538,12 +564,12 @@ socket_opts() ->
 -spec pick_server() -> [proplists:property()].
 pick_server() ->
     Servers = amoc_config:get(xmpp_servers),
-    verify(Servers),
+    verify_host_addr_defined(Servers),
     S = length(Servers),
     N = erlang:phash2(self(), S) + 1,
     lists:nth(N, Servers).
 
-verify(Servers) ->
+verify_host_addr_defined(Servers) ->
     lists:foreach(
       fun(Proplist) ->
               true = proplists:is_defined(host, Proplist)
