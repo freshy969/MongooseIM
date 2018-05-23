@@ -38,29 +38,35 @@
 
 all() ->
     [
-     {group, accounts},
-     {group, sessions},
-     {group, vcard},
-     {group, roster},
-     {group, roster_advanced},
-     {group, last},
-     {group, private},
-     {group, stanza},
-     {group, stats},
-     {group, basic}
+     {group, endurance}
+     %{group, accounts},
+     %{group, sessions},
+     %{group, vcard},
+     %{group, roster},
+     %{group, roster_advanced},
+     %{group, last},
+     %{group, private},
+     %{group, stanza},
+     %{group, stats}
+     %{group, basic}
     ].
 
 groups() ->
-     [{accounts, [sequence], accounts()},
-      {sessions, [sequence], sessions()},
-      {vcard, [sequence], vcard()},
-      {roster, [sequence], roster()},
-      {last, [sequence], last()},
-      {private, [sequence], private()},
-      {stanza, [sequence], stanza()},
-      {roster_advanced, [sequence], roster_advanced()},
-      {basic, [sequence], basic()},
-      {stats, [sequence], stats()}].
+    [{endurance, [{repeat_until_any_fail, 100}], groups_()}] ++ groups_().
+
+groups_() ->
+    [
+     %{accounts, [sequence], accounts()},
+     %{sessions, [sequence], sessions()},
+     %{vcard, [sequence], vcard()},
+     %{roster, [sequence], roster()},
+     %{last, [sequence], last()},
+     %{private, [sequence], private()},
+     %{stanza, [sequence], stanza()},
+     {roster_advanced, [sequence], roster_advanced()},
+     %{basic, [sequence], basic()},
+     {stats, [sequence], stats()}
+    ].
 
 basic() ->
     [simple_register, simple_unregister, register_twice,
@@ -860,11 +866,14 @@ create_stanza(Name1, JID2) ->
 
 stats_global(Config) ->
     escalus:story(Config, [{alice, 1}, {bob, 1}], fun(_Alice, _Bob) ->
-                RegisteredCount = length(escalus_config:get_config(escalus_users, Config, [])),
+                EscalusUsers = escalus_config:get_config(escalus_users, Config, []),
+                RegisteredCount = length(EscalusUsers),
                 Registered = integer_to_list(RegisteredCount) ++ "\n",
+                ct:pal("escalus users: ~p", [EscalusUsers]),
 
                 {UpTime, 0} = ejabberdctl("stats", ["uptimeseconds"], Config),
                 _ = list_to_integer(string:strip(UpTime, both, $\n)),
+                ct:pal("ets:tab2list(passwd): ~p", [rpc(mim(), ets, tab2list, [passwd])]),
                 {Registered, 0} = ejabberdctl("stats", ["registeredusers"], Config),
 
                 {"2\n", 0} = ejabberdctl("stats", ["onlineusersnode"], Config),
