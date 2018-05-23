@@ -35,7 +35,7 @@ all() ->
     [{group, positive}].
 
 groups() ->
-    [{positive, [parallel], success_response() ++ complex()}].
+    [{positive, [parallel, {repeat_until_any_fail, 100}], success_response() ++ complex()}].
 
 success_response() ->
     [
