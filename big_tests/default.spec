@@ -11,7 +11,7 @@
 %% do not remove below SUITE if testing mongoose
 {suites, "tests", mongoose_sanity_checks_SUITE}.
 
-{suites, "tests", muc_http_api_SUITE}.
+{suites, "tests", ejabberdctl_SUITE}.
 
 {config, ["test.config"]}.
 {logdir, "ct_report"}.
